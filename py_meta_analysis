@@ -1,0 +1,314 @@
+# %load /home/pskene/bin/py_meta_analysis.py
+import pandas as pd
+from pandas import DataFrame
+import glob
+import pybedtools
+from pybedtools import BedTool
+from pybedtools import featurefuncs
+import matplotlib.pyplot as plt
+%matplotlib inline
+import numpy as np
+
+def py_meta_analysis(list_bedgraphs, target_bed, list_meanoutputfilenames=[], list_heatmapfilenames=[], chrom_sizes='hg19', distance=1000,
+                     stranded = True, rank=False, mean_output=True, mean_image=True, heatmapfile_with_labels = True, heatmapfile_no_labels = False, 
+                     heatmap_image=True, save_combined_means=True):
+    """    
+    
+    Will plot bedgraph score data at a symmetrical distance from the midpoint locations of the target bed file. 
+    Will generate mean average data at each base pair position and also generate files for heatmaps
+    
+    __________
+    Parameters:
+    list_bedgraphs: list of bedgraphs (); use import glob ; bgFiles=glob.glob('*.bg') OR bgFiles=glob.glob('test.bg') or can manually type
+                    e.g. list_bedgraphs = ['A.bg', 'B.bg', 'C.bg']
+                    Can include path info if need to to direct location: import glob; import os.path as op; glob.glob(op.join('/home/pskene/data', '*.bg')))
+                    or ['/home/pskene/data/A.bg', '/home/pskene/data/B.bg', '/home/pskene/data/C.bg']
+    
+    target_bed: path to bed file to perform analysis over, with the following REQUIRED format 
+    <chr> <start> <stop> <id> <score> <strand>
+    
+    chrom_sizes: file with chrom sizes, can also just type e.g. hg19, mm9 and pybedtools will find the info
+    
+    distance: lengths of flanks either side of midpoint of feature
+    
+    stranded: orients based on strand (col 6 of target bed file), change to False, if no strand info
+    
+    rank: option of ranking the resulting file by score in original target bed (highest at top). If false, then original
+          order of target_bed is maintained
+          
+    mean_output: generate mean average file for each bp position (will create default name unless specified)
+    
+    mean_image: if True, generate a snapshot of what the mean data looks like
+                 
+    list_meanoutputfilenames: option for user defined filenames e.g. ['A', 'B', 'C']; must be a list, otherwise defaults will be created
+    
+    heatmapfile_with_labels: saves file for making heatmaps, includes bedfile columns and header with bp position
+    
+    heatmapfile_no labels: saves file for making heatmaps, excludes bedfile columns and header with bp position
+    
+    list_heatmapfilenames: option for user defined filenames e.g. ['A', 'B', 'C']; must be a list, otherwise defaults will be created
+    
+    heatmap_image: if True, will generate a snapshots of the heatmaps. All heatmaps have the same color range: 0 to max of mean data
+                  for all the heatmaps
+    
+    save_combined_means: if true, will save the combined dataframe of the means used to generate the image
+    
+    
+    ____________
+    Requirements (type the following before invoking jupyter):
+    pip install pybedtools (only needs to be done once to install)
+    
+    """
+    from datetime import datetime
+    startTime = datetime.now()
+
+    #pybedtools.set_tempdir('/loc/scratch/pskene')
+    
+    print 'assumes target bed file is in standard 6 column UCSC format: '\
+    '<chr> <start> <stop> <id> <score> <strand>'
+    
+    if heatmapfile_with_labels == True and heatmapfile_no_labels == True:
+        return 'WARNING: heatmapfile_with_labels and heatmap_no labels both set to true' \
+        'script expects only one value to be True, as output file has the same name'\
+        'Exiting...'
+    
+    if type(list_bedgraphs) != list:
+        return "list_bedgraphs is not a list; type import glob ; bgFiles = glob.glob('*.bg') OR bgFiles = ['test.bg']. Exiting..."
+    
+    if len(list_bedgraphs) == 0:
+        return 'list_bedgraphs is empty, no files imported. Exiting...'
+    
+    if type(list_meanoutputfilenames) !=list:
+        return "list_meanoutputfilenames must be provided as a list of names: e.g. ['A', 'B', 'C']"
+        
+    if len(list_meanoutputfilenames)>0 and len(list_bedgraphs)==len(list_meanoutputfilenames):
+        return 'if user supplies list_meanoutputfilenames, the list must be as long as the number of bedgraphs imported'
+    
+    if type(list_heatmapfilenames) !=list:
+        return "list_heatmapfilenames must be provided as a list of names: e.g. ['A', 'B', 'C']"
+        
+    if len(list_heatmapfilenames)>0 and len(list_bedgraphs)==len(list_heatmapfilenames):
+        return 'if user supplies list_heatmapfilenames, the list must be as long as the number of bedgraphs imported'
+    
+    
+    #perform operations on target_bed first, as common to all files in list_bedgraphs
+    target = BedTool(target_bed)
+    
+    #first need to determine the midpoint of each feature in the target_bed
+    target_mids = target.each(featurefuncs.midpoint)
+    
+    #create the window of interest
+    regions = target_mids.slop(genome = chrom_sizes, b = distance)
+    
+    #make 1 bp windows over the entire interval for each region
+    #col4 is ID  from original bed 'underscore' window number
+    #output is <chr> <start> <stop> <id_1> ....
+    #                               <id_2001>
+    regions_windows = regions.window_maker(b = regions, w = 1, i = 'srcwinnum')
+    
+    #sort regions_windows file (NB id info is still maintained, but sorting required for map function
+    #even if now overlapping regions of interest from two peaks less than e.g 1kb apart)
+    regions_windows_sorted = regions_windows.sort()
+    print 'Generated windows on target_bed file'
+    
+    #need to loop over each file in the list_bedgraphs
+    print 'Bedgraphs imported: '
+    print '\n'.join(list_bedgraphs) 
+    print '\n'
+    
+    #create empty dataframe to be populated by mean values from each bedgraph
+    temp_combined_mean = pd.DataFrame(index=range((distance * -1), (distance +1)))
+    
+    #create empty list to be populated by dataframes for each heatmap to make images
+    temp_heatmap_dfs = []
+    
+    #create empty list that will be filled by mean_output filenames
+    list_mean_outputs = []
+    
+    #create empty list that will be filled by heatmap filenames
+    list_heatmap_outputs = []
+    
+    
+    for i in range(len(list_bedgraphs)):
+        print 'Computing for bedgraph: ' + list_bedgraphs[i]
+        data = BedTool(list_bedgraphs[i])
+    
+        #find corresponding bedgraph score at each 1bp window, missing values called as 0
+        bedgraph_map = regions_windows_sorted.map(a = regions_windows_sorted, b = data, c = 4, null = 0)
+    
+        #need to switch it to a pandas dataframe for column manipulation
+        data_DF = bedgraph_map.to_dataframe()
+    
+        #bedtools slop function places name in col4 as described above <id1_1>....<id_2001>
+        #need to split this info to separate columns to allow groupby functions, e.g.
+        #in col4: <id1>...., in col5: <1>.... <2001>
+        data_DF.insert(4, 'bp_position', data_DF['name'].str.split('_', 1).str.get(1).astype(int))
+    
+        data_DF['name'] = data_DF['name'].str.split('_', 1).str.get(0)
+    
+        ##bedtools needed a sorted file, which means some for some peak sites, there maybe overlapping
+        #windows, which are now jumbled. Sort by <id> and <bp_position>
+        data_DF.sort_values(by = ['name', 'bp_position'], axis= 0, inplace=True, ascending=True)
+    
+        #groupby id# and report score as a list for each id#
+        grouped = DataFrame(data_DF.groupby('name')['score'].apply(list))
+        #turn list of scores into separate columns of dataframe
+        #each row is a unique id# which forms the index used in the merge below
+        collapsed = grouped['score'].apply(pd.Series)
+        #rename columns to represent bp position relative to midpoint
+        collapsed.columns  = range((distance*-1), (distance+1))
+       
+        #merge with original bed file based on ID number
+        #need to make target_bed a dataframe first
+        target_bed_DF = target.to_dataframe()
+    
+        combined = pd.merge(target_bed_DF, collapsed, left_on= 'name' , right_index = True)
+    
+        if stranded == False:
+            print 'Stranded argument = False. Will not attempt to orient on strand'
+        
+        if stranded:
+            print 'Orienting based on strand (col 6 of target bed file)'
+            #split combined DF into rows with + or - strans
+            combined_plus = combined[combined['strand'] == '+']
+            combined_neg = combined[combined['strand'] == '-']
+        
+            #create list with data columns switched but not bed file column names
+            reorder = combined.columns[0:6].tolist() + combined.columns[:5:-1].tolist()
+            #flip the - strand rows only
+            combined_neg_flipped = combined_neg[reorder]
+        
+            #rename the columns of combined_neg_flipped and then concatentate. Resort based on order of target_bed file
+            combined_neg_flipped.columns = ['chrom', 'start', 'end', 'name', 'score', 'strand'] +  range((distance*-1), (distance+1))
+        
+            combined = pd.concat([combined_plus, combined_neg_flipped]).sort_index()
+        
+        #currently the data is ordered as per the original target_bed file
+        #option of ranking by score column in original target_bed file     
+        if rank:
+            print 'Ranking heatmap file by target bed score (col 4)'
+            combined.sort_values(by = ['score'], inplace= True, ascending =False)
+        
+        
+        #if mean_output is True, generate a file with column means
+        if mean_output:
+            #create file name or use from initialized value. The split allows paths to target_bed to be used. As filenames can't include
+            #'/' in them, the split just takes the final part of the path (the filename as the target_bed_name
+            print 'Generating mean data'
+            
+            bedgraph_name = list_bedgraphs[i].split('/')[-1]
+            target_bed_name = glob.glob(target_bed)[0].split('/')[-1]
+                    
+            if len(list_meanoutputfilenames) == 0:
+                mean_output_name = bedgraph_name + '_at_' + target_bed_name + '.mean'
+            
+            else:
+                mean_output_name = list_meanoutputfilenames[i] #use initialized value
+            
+            #add the name to the list to be printed at the end
+            list_mean_outputs.append(mean_output_name)
+                
+            #generate column means with mean_output_name as column title; save file
+            temp = combined.iloc[:, 6:].mean().to_frame(name = mean_output_name)
+        
+            temp.to_csv(mean_output_name, sep = '\t', header = True, index = True, index_label='bp')
+        
+            #add the series "temp" to the temp_combined_mean dataframe, so will be filled by loop. This is used to 
+            #print image at the end of the loop
+            temp_combined_mean = temp_combined_mean.join(temp)
+            
+                    
+        if heatmapfile_with_labels:
+            print 'Generating heatmap with labels'
+            
+            bedgraph_name = list_bedgraphs[i].split('/')[-1]
+            target_bed_name = glob.glob(target_bed)[0].split('/')[-1]
+        
+            if len(list_heatmapfilenames) == 0:
+                heatmap_name = 'output_heatmap_' + bedgraph_name + '_at_' + target_bed_name
+        
+            else:
+                heatmap_name = list_heatmapfilenames[i]
+            
+            #add the name to the list to be printed at the end
+            list_heatmap_outputs.append(heatmap_name)
+            
+            #save file
+            combined.to_csv(heatmap_name, sep = '\t', header = True, index = False)
+            
+            #to make heatmap images, save the data columns as a dataframe in a list of dataframe
+            if heatmap_image:
+                temp_heatmap_dfs.append(combined.iloc[:,6:])
+        
+        if heatmapfile_no_labels:
+            print 'generating heatmap without labels'
+            
+            bedgraph_name = list_bedgraphs[i].split('/')[-1]
+            target_bed_name = glob.glob(target_bed)[0].split('/')[-1]
+        
+            if len(list_heatmapfilenames) == 0:
+                heatmap_name = 'output_heatmap_' + bedgraph_name + '_at_' + target_bed_name
+        
+            else:
+                heatmap_name = list_heatmapfilenames[i]
+            
+            #add the name to the list to be printed at the end
+            list_heatmap_outputs.append(heatmap_name)
+        
+            #save file
+            combined.iloc[:,6:].to_csv(heatmap_name, sep = '\t', header = False, index = False)
+            
+            #to make heatmap images, save the data columns as a dataframe in a list of dataframe
+            if heatmap_image:
+                temp_heatmap_dfs.append(combined.iloc[:,6:])
+    
+        print '\n'
+    
+    print 'mean_outputs generated: '
+    print '\n'.join(list_mean_outputs)
+    print '\n'
+    
+    if mean_image:
+        if len(list_mean_outputs)==0:
+            print 'no mean data to generate image'
+        else:
+            print 'generating snapshot of mean data'
+            plt.plot(temp_combined_mean)
+            plt.title('combined_data.mean')
+            plt.xlabel('bp from midpoint')
+            plt.ylabel('normalized counts')
+            plt.legend(temp_combined_mean.columns.values.tolist(), bbox_to_anchor=(1.1, -0.6))
+        
+    if save_combined_means:
+        if len(list_mean_outputs)==0:
+            print 'no mean data to populate combined_data.mean'
+        else:
+            print 'saving combined_data.mean'
+            temp_combined_mean.to_csv('combined_data.mean', sep = '\t', header = True, index = True, index_label='bp')
+    
+    print '\n'
+    print 'heatmap files generated: '
+    print '\n'.join(list_heatmap_outputs)
+    print '\n'
+            
+    if heatmap_image:
+        if len(list_heatmap_outputs)==0:
+            print 'no heatmap files generates to create images'
+        else:
+            print 'generating snapshots of the heatmaps'
+            #calculate the max column mean for all the heatmap dataframes, use this to set color range of heatmaps
+            temp_list = []
+            for item in temp_heatmap_dfs:
+                temp_list.append(item.mean().max())
+            max_value = max(temp_list)
+        
+            for i in range(len(temp_heatmap_dfs)):
+                matrix = np.asarray(temp_heatmap_dfs[i])
+                fig = plt.figure(figsize=(2,5))
+                plt.title(list_heatmap_outputs[i])
+                plt.imshow(matrix,cmap=plt.cm.Reds,vmin=0,vmax=max_value, aspect = 'auto')
+                plt.axis('off')
+
+        
+    print datetime.now() - startTime
+    return 'Finished'
